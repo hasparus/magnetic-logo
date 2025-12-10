@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Neue Montreal";
+  src: url("https://the-guild.dev/graphql/hive/_next/static/media/dc03e58dafb0f94e-s.p.woff2")
+    format("woff2");
+  font-display: block;
+}
+
+@media (prefers-reduced-motion) {
+  *,
+  ::before,
+  ::after {
+    animation: none !important;
+  }
+}
+
+html {
+  background-color: #000;
+  font-family: "Neue Montreal", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+}

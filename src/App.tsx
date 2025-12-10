@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import "./index.css";
-import { createParticleSystem, type ParticleSystem } from "./particles";
 import { GUI } from "lil-gui";
+
+import { createParticleSystem, type ParticleSystem } from "./particles";
+
+import "./index.css";
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -11,6 +13,8 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [particleCount, setParticleCount] = useState(750);
   const [edgeWeight, setEdgeWeight] = useState(5);
+  const [scatter, setScatter] = useState(0.3);
+  const [seed, setSeed] = useState(409969);
   const setHovering = (value: boolean) => {
     particleSystemRef.current?.setHovering(value);
   };
@@ -29,7 +33,12 @@ export function App() {
     };
     updateCanvasSize();
 
-    async function init(count: number, edge: number) {
+    async function init(
+      count: number,
+      edge: number,
+      scatterAmount: number,
+      seedValue: number
+    ) {
       try {
         if (!navigator.gpu) {
           throw new Error("WebGPU is not supported in this browser");
@@ -38,6 +47,8 @@ export function App() {
         const system = await createParticleSystem(canvas!, {
           particleCount: count,
           edgeWeight: edge,
+          scatter: scatterAmount,
+          seed: seedValue,
         });
 
         if (mounted) {
@@ -54,31 +65,43 @@ export function App() {
       }
     }
 
-    init(particleCount, edgeWeight);
+    init(particleCount, edgeWeight, scatter, seed);
     const gui = new GUI({ title: "Particles" });
     guiRef.current = gui;
     const params = {
       particleCount,
       edgeWeight,
-      regenerate: () => {
-        mounted && init(particleCount, edgeWeight);
-      },
+      scatter,
+      seed,
     };
     gui
       .add(params, "particleCount", 100, 3000, 50)
       .name("Count")
       .onFinishChange((value: number) => {
         setParticleCount(value);
-        init(value, edgeWeight);
+        init(value, edgeWeight, scatter, seed);
       });
     gui
       .add(params, "edgeWeight", 1, 8, 1)
       .name("Edge weight")
       .onFinishChange((value: number) => {
         setEdgeWeight(value);
-        init(particleCount, value);
+        init(particleCount, value, scatter, seed);
       });
-    gui.add(params, "regenerate").name("Rebuild");
+    gui
+      .add(params, "scatter", 0, 1.5, 0.05)
+      .name("Scatter")
+      .onFinishChange((value: number) => {
+        setScatter(value);
+        init(particleCount, edgeWeight, value, seed);
+      });
+    gui
+      .add(params, "seed", 1, 1_000_000, 1)
+      .name("Seed")
+      .onFinishChange((value: number) => {
+        setSeed(value);
+        init(particleCount, edgeWeight, scatter, value);
+      });
 
     window.addEventListener("resize", updateCanvasSize);
 
@@ -90,7 +113,7 @@ export function App() {
       guiRef.current?.destroy();
       guiRef.current = null;
     };
-  }, [particleCount, edgeWeight]);
+  }, [particleCount, edgeWeight, scatter, seed]);
 
   return (
     <main className="overflow-hidden fixed inset-0">

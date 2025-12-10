@@ -21,6 +21,16 @@ const Uniforms = d.struct({
 
 type Vec2 = d.Infer<typeof d.vec2f>;
 
+const makeRng = (seed: number) => {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+};
+
 const logoPixelPositionsCache = new Map<number, Promise<Vec2[]>>();
 
 async function loadLogoPixelPositions(edgeWeight: number): Promise<Vec2[]> {
@@ -90,14 +100,18 @@ async function loadLogoPixelPositions(edgeWeight: number): Promise<Vec2[]> {
   return promise;
 }
 
-async function generateLogoPoints(count: number, edgeWeight: number): Promise<Vec2[]> {
+async function generateLogoPoints(
+  count: number,
+  edgeWeight: number,
+  rng: () => number
+): Promise<Vec2[]> {
   const positions = await loadLogoPixelPositions(edgeWeight);
   const points: Vec2[] = [];
   const jitter = 0.0025;
   for (let i = 0; i < count; i++) {
-    const base = positions[Math.floor(Math.random() * positions.length)]!;
-    const dx = (Math.random() - 0.5) * jitter;
-    const dy = (Math.random() - 0.5) * jitter;
+    const base = positions[Math.floor(rng() * positions.length)]!;
+    const dx = (rng() - 0.5) * jitter;
+    const dy = (rng() - 0.5) * jitter;
     const x = Math.max(-1, Math.min(1, base.x + dx));
     const y = Math.max(-1, Math.min(1, base.y + dy));
     points.push(d.vec2f(x, y));
@@ -115,16 +129,18 @@ export interface ParticleSystem {
 }
 
 export interface ParticleSystemOptions {
-  particleCount?: number;
-  edgeWeight?: number;
+  particleCount: number;
+  edgeWeight: number;
+  scatter: number;
+  seed: number;
 }
 
 export async function createParticleSystem(
   canvas: HTMLCanvasElement,
-  options: ParticleSystemOptions = {}
+  options: ParticleSystemOptions
 ): Promise<ParticleSystem> {
-  const PARTICLE_COUNT = options.particleCount ?? 500;
-  const EDGE_WEIGHT = options.edgeWeight ?? 3;
+  const { particleCount, edgeWeight, scatter, seed } = options;
+  const rng = makeRng(seed);
 
   const root = await tgpu.init();
   const device = root.device;
@@ -133,9 +149,10 @@ export async function createParticleSystem(
   if (!context) {
     throw new Error("WebGPU not supported");
   }
+  const gpuContext = context as GPUCanvasContext;
 
   const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({
+  gpuContext.configure({
     device,
     format: presentationFormat,
     alphaMode: "premultiplied",
@@ -145,9 +162,9 @@ export async function createParticleSystem(
   const uniforms = root.createUniform(Uniforms);
 
   // Create sized array types for buffers
-  const ParticleArraySized = d.arrayOf(Particle, PARTICLE_COUNT);
-  const TargetArraySized = d.arrayOf(d.vec2f, PARTICLE_COUNT);
-  const RestArraySized = d.arrayOf(d.vec2f, PARTICLE_COUNT);
+  const ParticleArraySized = d.arrayOf(Particle, particleCount);
+  const TargetArraySized = d.arrayOf(d.vec2f, particleCount);
+  const RestArraySized = d.arrayOf(d.vec2f, particleCount);
 
   // Create unsized array types for bind group layout
   const ParticleArrayType = d.arrayOf(Particle);
@@ -157,27 +174,30 @@ export async function createParticleSystem(
   const particleBuffers = [
     root.createBuffer(ParticleArraySized).$usage("storage", "vertex"),
     root.createBuffer(ParticleArraySized).$usage("storage", "vertex"),
-  ];
+  ] as const;
 
   const targetBuffer = root.createBuffer(TargetArraySized).$usage("storage");
   const restBuffer = root.createBuffer(RestArraySized).$usage("storage");
 
   // Initialize data
-  const logoPoints = await generateLogoPoints(PARTICLE_COUNT, EDGE_WEIGHT);
-  const restPositions = Array.from({ length: PARTICLE_COUNT }, () =>
-    d.vec2f(Math.random() * 1.8 - 0.9, Math.random() * 1.8 - 0.9)
-  );
+  const logoPoints = await generateLogoPoints(particleCount, edgeWeight, rng);
+  const assignedTargets = logoPoints.slice(0, particleCount);
+  const maxOffset = scatter;
+  const restPositions = assignedTargets.map((t) => {
+    const angle = rng() * Math.PI * 2;
+    const radius = rng() * maxOffset;
+    const rx = t.x + Math.cos(angle) * radius;
+    const ry = t.y + Math.sin(angle) * radius;
+    return d.vec2f(rx, ry);
+  });
   const initialParticles = restPositions.map((p) => ({
     position: p,
-    velocity: d.vec2f(
-      (Math.random() - 0.5) * 0.02,
-      (Math.random() - 0.5) * 0.02
-    ),
+    velocity: d.vec2f(0, 0),
   }));
 
   particleBuffers[0].write(initialParticles);
   particleBuffers[1].write(initialParticles);
-  targetBuffer.write(logoPoints);
+  targetBuffer.write(assignedTargets);
   restBuffer.write(restPositions);
 
   // Compute bind group layout (uses unsized array types)
@@ -191,21 +211,13 @@ export async function createParticleSystem(
   const { particlesIn, particlesOut, targets, restTargets } =
     computeBindGroupLayout.bound;
 
-  // GPU noise function
-  const noise = (p: d.v2f) => {
-    "use gpu";
-    return std.fract(
-      std.sin(std.dot(p, d.vec2f(12.9898, 78.233))) * 43758.5453
-    );
-  };
-
   // Simulation function
   const simulate = (index: number) => {
     "use gpu";
     const u = uniforms.$;
-    const particle = Particle(particlesIn.value[index]);
-    const target = targets.value[index];
-    const rest = restTargets.value[index];
+    const particle = Particle(particlesIn.value[index]!);
+    const target = targets.value[index]!;
+    const rest = restTargets.value[index]!;
     const pos = particle.position;
     const vel = particle.velocity;
     const hover = u.hoverStrength;
@@ -229,7 +241,7 @@ export async function createParticleSystem(
 
     const springStrength = std.mix(18.0, 32.0, hover);
     const dampingStrength = std.mix(12.0, 3.0, hover);
-    const springForce = std.mul(targetDir, targetDist * springStrength);
+    const springForce = std.mul(targetDir, targetDist * springStrength * hover);
     const dampingForce = std.mul(vel, -dampingStrength);
 
     const restForce = std.mul(std.sub(rest, pos), 6.0 * (1.0 - hover));
@@ -263,25 +275,6 @@ export async function createParticleSystem(
     // Update position
     particle.position = std.add(pos, std.mul(particle.velocity, dt));
 
-    // Soft boundaries
-    const boundary = 0.95;
-    if (particle.position.x > boundary) {
-      particle.position.x = boundary * 0.99;
-      particle.velocity.x = particle.velocity.x * -0.3;
-    }
-    if (particle.position.x < -boundary) {
-      particle.position.x = -boundary * 0.99;
-      particle.velocity.x = particle.velocity.x * -0.3;
-    }
-    if (particle.position.y > boundary) {
-      particle.position.y = boundary * 0.99;
-      particle.velocity.y = particle.velocity.y * -0.3;
-    }
-    if (particle.position.y < -boundary) {
-      particle.position.y = -boundary * 0.99;
-      particle.velocity.y = particle.velocity.y * -0.3;
-    }
-
     particlesOut.value[index] = Particle(particle);
   };
 
@@ -291,8 +284,8 @@ export async function createParticleSystem(
   // Create compute bind groups for ping-pong
   const computeBindGroups = [0, 1].map((idx) =>
     root.createBindGroup(computeBindGroupLayout, {
-      particlesIn: particleBuffers[idx],
-      particlesOut: particleBuffers[1 - idx],
+      particlesIn: particleBuffers[idx]!,
+      particlesOut: particleBuffers[1 - idx]!,
       targets: targetBuffer,
       restTargets: restBuffer,
     })
@@ -419,19 +412,19 @@ export async function createParticleSystem(
 
     // Run compute shader
     computePipeline
-      .with(computeBindGroups[even ? 0 : 1])
-      .dispatchThreads(PARTICLE_COUNT);
+      .with(computeBindGroups[even ? 0 : 1]!)
+      .dispatchThreads(particleCount);
 
     // Render
     renderPipeline
       .withColorAttachment({
-        view: context.getCurrentTexture().createView(),
+        view: gpuContext.getCurrentTexture().createView(),
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
         loadOp: "clear",
         storeOp: "store",
       })
-      .with(instanceLayout, particleBuffers[even ? 1 : 0])
-      .draw(6, PARTICLE_COUNT);
+      .with(instanceLayout, particleBuffers[even ? 1 : 0]!)
+      .draw(6, particleCount);
 
     frameId = requestAnimationFrame(animate);
   }

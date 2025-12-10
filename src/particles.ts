@@ -3,10 +3,6 @@ import * as d from "typegpu/data";
 import * as std from "typegpu/std";
 import hiveLogoPng from "./hive-logo.png";
 
-// ============================================================================
-// DATA SCHEMAS
-// ============================================================================
-
 const Particle = d.struct({
   position: d.vec2f,
   velocity: d.vec2f,
@@ -17,6 +13,11 @@ const Uniforms = d.struct({
   hoverStrength: d.f32,
   time: d.f32,
   aspectRatio: d.f32,
+  gravityStrength: d.f32,
+  massCount: d.f32,
+  wiggleOffsetScale: d.f32,
+  wiggleForceScale: d.f32,
+  repelStrength: d.f32,
 });
 
 type Vec2 = d.Infer<typeof d.vec2f>;
@@ -103,7 +104,7 @@ async function loadLogoPixelPositions(edgeWeight: number): Promise<Vec2[]> {
 async function generateLogoPoints(
   count: number,
   edgeWeight: number,
-  rng: () => number
+  rng: () => number,
 ): Promise<Vec2[]> {
   const positions = await loadLogoPixelPositions(edgeWeight);
   const points: Vec2[] = [];
@@ -119,10 +120,6 @@ async function generateLogoPoints(
   return points;
 }
 
-// ============================================================================
-// PARTICLE SYSTEM
-// ============================================================================
-
 export interface ParticleSystem {
   setHovering: (hovering: boolean) => void;
   destroy: () => void;
@@ -133,13 +130,26 @@ export interface ParticleSystemOptions {
   edgeWeight: number;
   scatter: number;
   seed: number;
+  gravityStrength: number;
+  wiggleOffsetScale: number;
+  wiggleForceScale: number;
+  repelStrength: number;
 }
 
 export async function createParticleSystem(
   canvas: HTMLCanvasElement,
-  options: ParticleSystemOptions
+  options: ParticleSystemOptions,
 ): Promise<ParticleSystem> {
-  const { particleCount, edgeWeight, scatter, seed } = options;
+  const {
+    particleCount,
+    edgeWeight,
+    scatter,
+    seed,
+    gravityStrength,
+    wiggleOffsetScale,
+    wiggleForceScale,
+    repelStrength,
+  } = options;
   const rng = makeRng(seed);
 
   const root = await tgpu.init();
@@ -163,7 +173,7 @@ export async function createParticleSystem(
 
   // Create sized array types for buffers
   const ParticleArraySized = d.arrayOf(Particle, particleCount);
-  const TargetArraySized = d.arrayOf(d.vec2f, particleCount);
+  const MassArraySized = d.arrayOf(d.vec2f, particleCount);
   const RestArraySized = d.arrayOf(d.vec2f, particleCount);
 
   // Create unsized array types for bind group layout
@@ -176,14 +186,14 @@ export async function createParticleSystem(
     root.createBuffer(ParticleArraySized).$usage("storage", "vertex"),
   ] as const;
 
-  const targetBuffer = root.createBuffer(TargetArraySized).$usage("storage");
+  const massBuffer = root.createBuffer(MassArraySized).$usage("storage");
   const restBuffer = root.createBuffer(RestArraySized).$usage("storage");
 
   // Initialize data
   const logoPoints = await generateLogoPoints(particleCount, edgeWeight, rng);
-  const assignedTargets = logoPoints.slice(0, particleCount);
+  const logoMassPoints = logoPoints.slice(0, particleCount);
   const maxOffset = scatter;
-  const restPositions = assignedTargets.map((t) => {
+  const restPositions = logoMassPoints.map((t) => {
     const angle = rng() * Math.PI * 2;
     const radius = rng() * maxOffset;
     const rx = t.x + Math.cos(angle) * radius;
@@ -197,26 +207,29 @@ export async function createParticleSystem(
 
   particleBuffers[0].write(initialParticles);
   particleBuffers[1].write(initialParticles);
-  targetBuffer.write(assignedTargets);
+  massBuffer.write(logoMassPoints);
   restBuffer.write(restPositions);
 
   // Compute bind group layout (uses unsized array types)
   const computeBindGroupLayout = tgpu.bindGroupLayout({
     particlesIn: { storage: ParticleArrayType },
     particlesOut: { storage: ParticleArrayType, access: "mutable" },
-    targets: { storage: TargetArrayType },
+    massPoints: { storage: TargetArrayType },
     restTargets: { storage: RestArrayType },
   });
 
-  const { particlesIn, particlesOut, targets, restTargets } =
-    computeBindGroupLayout.bound;
+  const {
+    particlesIn,
+    particlesOut,
+    massPoints: massPointsBinding,
+    restTargets,
+  } = computeBindGroupLayout.bound;
 
   // Simulation function
   const simulate = (index: number) => {
     "use gpu";
     const u = uniforms.$;
     const particle = Particle(particlesIn.value[index]!);
-    const target = targets.value[index]!;
     const rest = restTargets.value[index]!;
     const pos = particle.position;
     const vel = particle.velocity;
@@ -225,22 +238,37 @@ export async function createParticleSystem(
     const dt = u.deltaTime;
     const particleIdx = d.f32(index);
 
+    const massCount = d.i32(u.massCount);
+    let nearest = massPointsBinding.value[0]!;
+    let nearestDiff = std.sub(nearest, pos);
+    let nearestDistSq = std.dot(nearestDiff, nearestDiff);
+    for (let i = 1; i < massCount; i++) {
+      const m = massPointsBinding.value[i]!;
+      const diff = std.sub(m, pos);
+      const distSq = std.dot(diff, diff);
+      const closer = distSq < nearestDistSq;
+      nearestDistSq = std.select(nearestDistSq, distSq, closer);
+      nearestDiff = std.select(nearestDiff, diff, closer);
+      nearest = std.select(nearest, m, closer);
+    }
+
     const wigglePhaseX = time * 4.0 + particleIdx * 0.17;
     const wigglePhaseY = time * 3.4 + particleIdx * 0.11;
     const wiggle = d.vec2f(std.sin(wigglePhaseX), std.cos(wigglePhaseY));
-    const wiggleOffset = std.mul(wiggle, 0.005 * hover);
-    const targetPos = std.add(target, wiggleOffset);
+    const wiggleOffset = std.mul(wiggle, u.wiggleOffsetScale * hover);
+    const targetPos = std.add(nearest, wiggleOffset);
 
     const toTarget = std.sub(targetPos, pos);
     const targetDist = std.length(toTarget);
     const targetDir = std.select(
       d.vec2f(0, 0),
       std.mul(toTarget, 1.0 / targetDist),
-      targetDist > 0.001
+      targetDist > 0.001,
     );
 
     const springStrength = std.mix(18.0, 32.0, hover);
     const dampingStrength = std.mix(12.0, 3.0, hover);
+    const gravity = std.mul(targetDir, u.gravityStrength * hover);
     const springForce = std.mul(targetDir, targetDist * springStrength * hover);
     const dampingForce = std.mul(vel, -dampingStrength);
 
@@ -249,14 +277,45 @@ export async function createParticleSystem(
     const wiggleForce = std.mul(
       d.vec2f(
         std.sin(time * 5.5 + particleIdx * 0.23),
-        std.cos(time * 5.2 + particleIdx * 0.29)
+        std.cos(time * 5.2 + particleIdx * 0.29),
       ),
-      0.2 * hover
+      u.wiggleForceScale * hover,
     );
+
+    const repulsionRadius = 0.05;
+    const repulsionRadiusSq = repulsionRadius * repulsionRadius;
+    const repulsionStrength = u.repelStrength;
+    let repulsionForce = d.vec2f(0, 0);
+    const count = massCount;
+    for (let step = 1; step <= 37; step += 12) {
+      const neighborIdx = (index + step) % count;
+      const other = Particle(particlesIn.value[neighborIdx]!);
+      const diff = std.sub(pos, other.position);
+      const distSq = std.dot(diff, diff);
+      const within = distSq < repulsionRadiusSq;
+      const safeDist = std.max(distSq, 1e-5);
+      const invDist = std.div(1.0, std.sqrt(safeDist));
+      const dir = std.mul(diff, invDist);
+      const push = std.mul(
+        dir,
+        (repulsionRadius - std.sqrt(safeDist)) * repulsionStrength,
+      );
+      repulsionForce = std.select(
+        repulsionForce,
+        std.add(repulsionForce, push),
+        within,
+      );
+    }
 
     const totalForce = std.add(
       restForce,
-      std.add(springForce, std.add(dampingForce, wiggleForce))
+      std.add(
+        repulsionForce,
+        std.add(
+          gravity,
+          std.add(springForce, std.add(dampingForce, wiggleForce)),
+        ),
+      ),
     );
 
     // Update velocity with damping
@@ -269,7 +328,7 @@ export async function createParticleSystem(
     particle.velocity = std.select(
       particle.velocity,
       std.mul(particle.velocity, maxSpeed / speed),
-      speed > maxSpeed
+      speed > maxSpeed,
     );
 
     // Update position
@@ -286,9 +345,9 @@ export async function createParticleSystem(
     root.createBindGroup(computeBindGroupLayout, {
       particlesIn: particleBuffers[idx]!,
       particlesOut: particleBuffers[1 - idx]!,
-      targets: targetBuffer,
+      massPoints: massBuffer,
       restTargets: restBuffer,
-    })
+    }),
   );
 
   // Vertex layout for instanced rendering
@@ -360,7 +419,7 @@ export async function createParticleSystem(
     return std.select(
       d.vec4f(0, 0, 0, 0),
       d.vec4f(input.color.x, input.color.y, input.color.z, smoothAlpha),
-      dist < 1.0
+      dist < 1.0,
     );
   });
 
@@ -406,6 +465,11 @@ export async function createParticleSystem(
       hoverStrength: hoverTransition,
       time: time,
       aspectRatio: canvas.width / canvas.height,
+      gravityStrength,
+      massCount: logoMassPoints.length,
+      wiggleOffsetScale,
+      wiggleForceScale,
+      repelStrength,
     });
 
     even = !even;

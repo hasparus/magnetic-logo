@@ -1,8 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "WebFetch(domain:docs.swmansion.com)",
-      "Bash(bun add:*)"
-    ]
+    "allow": ["WebFetch(domain:docs.swmansion.com)", "Bash(bun add:*)"]
   }
 }

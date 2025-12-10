@@ -23,7 +23,7 @@
 
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
     },
 
     // Some stricter flags (disabled by default)
@@ -31,8 +31,8 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false,
 
-    "types": ["@webgpu/types"]
+    "types": ["@webgpu/types"],
   },
 
-  "exclude": ["dist", "node_modules"]
+  "exclude": ["dist", "node_modules"],
 }

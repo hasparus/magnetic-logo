@@ -21,13 +21,12 @@ const Uniforms = d.struct({
 
 type Vec2 = d.Infer<typeof d.vec2f>;
 
-let logoPixelPositionsPromise: Promise<Vec2[]> | null = null;
+const logoPixelPositionsCache = new Map<number, Promise<Vec2[]>>();
 
-async function loadLogoPixelPositions(): Promise<Vec2[]> {
-  if (logoPixelPositionsPromise) {
-    return logoPixelPositionsPromise;
-  }
-  logoPixelPositionsPromise = (async () => {
+async function loadLogoPixelPositions(edgeWeight: number): Promise<Vec2[]> {
+  const cached = logoPixelPositionsCache.get(edgeWeight);
+  if (cached) return cached;
+  const promise = (async () => {
     const response = await fetch(hiveLogoPng);
     const blob = await response.blob();
     const bitmap = await createImageBitmap(blob);
@@ -48,28 +47,51 @@ async function loadLogoPixelPositions(): Promise<Vec2[]> {
     }
     context.drawImage(bitmap, 0, 0, width, height);
     const { data } = context.getImageData(0, 0, width, height);
-    const positions: Vec2[] = [];
+    const borderPositions: Vec2[] = [];
+    const fillPositions: Vec2[] = [];
+    const isSolid = (px: number, py: number) => {
+      if (px < 0 || py < 0 || px >= width || py >= height) return false;
+      const i = (py * width + px) * 4;
+      return (data[i + 3] ?? 0) > 0;
+    };
+
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        const idx = (y * width + x) * 4;
-        const alpha = data[idx + 3] ?? 0;
-        if (alpha > 0) {
-          const nx = ((x + 0.5) / width) * 2 - 1;
-          const ny = ((height - (y + 0.5)) / height) * 2 - 1;
-          positions.push(d.vec2f(nx, ny));
+        if (!isSolid(x, y)) continue;
+        const touchesEmpty =
+          !isSolid(x + 1, y) ||
+          !isSolid(x - 1, y) ||
+          !isSolid(x, y + 1) ||
+          !isSolid(x, y - 1) ||
+          !isSolid(x + 1, y + 1) ||
+          !isSolid(x - 1, y - 1) ||
+          !isSolid(x + 1, y - 1) ||
+          !isSolid(x - 1, y + 1);
+        const nx = ((x + 0.5) / width) * 2 - 1;
+        const ny = ((height - (y + 0.5)) / height) * 2 - 1;
+        fillPositions.push(d.vec2f(nx, ny));
+        if (touchesEmpty) {
+          borderPositions.push(d.vec2f(nx, ny));
         }
       }
     }
-    if (positions.length === 0) {
+    if (fillPositions.length === 0) {
       throw new Error("Logo mask empty");
+    }
+    const positions: Vec2[] = [];
+    positions.push(...fillPositions);
+    const borderWeight = Math.max(1, Math.floor(edgeWeight));
+    for (let i = 0; i < borderWeight; i++) {
+      positions.push(...borderPositions);
     }
     return positions;
   })();
-  return logoPixelPositionsPromise;
+  logoPixelPositionsCache.set(edgeWeight, promise);
+  return promise;
 }
 
-async function generateLogoPoints(count: number): Promise<Vec2[]> {
-  const positions = await loadLogoPixelPositions();
+async function generateLogoPoints(count: number, edgeWeight: number): Promise<Vec2[]> {
+  const positions = await loadLogoPixelPositions(edgeWeight);
   const points: Vec2[] = [];
   const jitter = 0.0025;
   for (let i = 0; i < count; i++) {
@@ -92,11 +114,17 @@ export interface ParticleSystem {
   destroy: () => void;
 }
 
+export interface ParticleSystemOptions {
+  particleCount?: number;
+  edgeWeight?: number;
+}
+
 export async function createParticleSystem(
-  canvas: HTMLCanvasElement
+  canvas: HTMLCanvasElement,
+  options: ParticleSystemOptions = {}
 ): Promise<ParticleSystem> {
-  // TODO: This should be configured buy lilgui
-  const PARTICLE_COUNT = 500;
+  const PARTICLE_COUNT = options.particleCount ?? 500;
+  const EDGE_WEIGHT = options.edgeWeight ?? 3;
 
   const root = await tgpu.init();
   const device = root.device;
@@ -135,7 +163,7 @@ export async function createParticleSystem(
   const restBuffer = root.createBuffer(RestArraySized).$usage("storage");
 
   // Initialize data
-  const logoPoints = await generateLogoPoints(PARTICLE_COUNT);
+  const logoPoints = await generateLogoPoints(PARTICLE_COUNT, EDGE_WEIGHT);
   const restPositions = Array.from({ length: PARTICLE_COUNT }, () =>
     d.vec2f(Math.random() * 1.8 - 0.9, Math.random() * 1.8 - 0.9)
   );

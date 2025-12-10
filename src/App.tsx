@@ -15,9 +15,9 @@ export function App() {
   const [edgeWeight, setEdgeWeight] = useState(5);
   const [scatter, setScatter] = useState(0.3);
   const [gravityStrength, setGravityStrength] = useState(0.08);
-  const [wiggleOffsetScale, setWiggleOffsetScale] = useState(0.004);
-  const [wiggleForceScale, setWiggleForceScale] = useState(0.16);
-  const [repelStrength, setRepelStrength] = useState(4);
+  const [wiggleOffsetScale, setWiggleOffsetScale] = useState(0.003);
+  const [wiggleForceScale, setWiggleForceScale] = useState(0.1);
+  const [repelStrength, setRepelStrength] = useState(10);
   const [seed, setSeed] = useState(409969);
   const setHovering = (value: boolean) => {
     particleSystemRef.current?.setHovering(value);
@@ -45,7 +45,7 @@ export function App() {
       gravity: number,
       wiggleOffset: number,
       wiggleForce: number,
-      repel: number
+      repel: number,
     ) {
       try {
         if (!navigator.gpu) {
@@ -85,7 +85,7 @@ export function App() {
       gravityStrength,
       wiggleOffsetScale,
       wiggleForceScale,
-      repelStrength
+      repelStrength,
     );
     const gui = new GUI({ title: "Particles" });
     guiRef.current = gui;
@@ -112,7 +112,7 @@ export function App() {
           gravityStrength,
           wiggleOffsetScale,
           wiggleForceScale,
-          repelStrength
+          repelStrength,
         );
       });
     gui
@@ -128,7 +128,7 @@ export function App() {
           gravityStrength,
           wiggleOffsetScale,
           wiggleForceScale,
-          repelStrength
+          repelStrength,
         );
       });
     gui
@@ -144,7 +144,7 @@ export function App() {
           gravityStrength,
           wiggleOffsetScale,
           wiggleForceScale,
-          repelStrength
+          repelStrength,
         );
       });
     gui
@@ -160,7 +160,7 @@ export function App() {
           gravityStrength,
           wiggleOffsetScale,
           wiggleForceScale,
-          repelStrength
+          repelStrength,
         );
       });
     gui
@@ -176,7 +176,7 @@ export function App() {
           value,
           wiggleOffsetScale,
           wiggleForceScale,
-          repelStrength
+          repelStrength,
         );
       });
     gui
@@ -192,7 +192,7 @@ export function App() {
           gravityStrength,
           value,
           wiggleForceScale,
-          repelStrength
+          repelStrength,
         );
       });
     gui
@@ -208,11 +208,11 @@ export function App() {
           gravityStrength,
           wiggleOffsetScale,
           value,
-          repelStrength
+          repelStrength,
         );
       });
     gui
-      .add(params, "repelStrength", 0, 10, 0.2)
+      .add(params, "repelStrength", 0, 2000, 0.2)
       .name("Repel")
       .onFinishChange((value: number) => {
         setRepelStrength(value);
@@ -224,7 +224,7 @@ export function App() {
           gravityStrength,
           wiggleOffsetScale,
           wiggleForceScale,
-          value
+          value,
         );
       });
 

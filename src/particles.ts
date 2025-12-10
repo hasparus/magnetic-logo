@@ -8,6 +8,17 @@ const Particle = d.struct({
   velocity: d.vec2f,
 });
 
+// Spatial hash grid configuration
+const GRID_SIZE = 32; // 32x32 grid
+const CELL_SIZE = 2.0 / GRID_SIZE; // World space is -1 to 1, so total size is 2
+const MAX_PARTICLES_PER_CELL = 32;
+const TOTAL_CELLS = GRID_SIZE * GRID_SIZE;
+
+const GridCell = d.struct({
+  count: d.atomic(d.u32),
+  particles: d.arrayOf(d.u32, MAX_PARTICLES_PER_CELL),
+});
+
 const Uniforms = d.struct({
   deltaTime: d.f32,
   hoverStrength: d.f32,
@@ -104,7 +115,7 @@ async function loadLogoPixelPositions(edgeWeight: number): Promise<Vec2[]> {
 async function generateLogoPoints(
   count: number,
   edgeWeight: number,
-  rng: () => number,
+  rng: () => number
 ): Promise<Vec2[]> {
   const positions = await loadLogoPixelPositions(edgeWeight);
   const points: Vec2[] = [];
@@ -138,7 +149,7 @@ export interface ParticleSystemOptions {
 
 export async function createParticleSystem(
   canvas: HTMLCanvasElement,
-  options: ParticleSystemOptions,
+  options: ParticleSystemOptions
 ): Promise<ParticleSystem> {
   const {
     particleCount,
@@ -180,6 +191,8 @@ export async function createParticleSystem(
   const ParticleArrayType = d.arrayOf(Particle);
   const TargetArrayType = d.arrayOf(d.vec2f);
   const RestArrayType = d.arrayOf(d.vec2f);
+  const GridArrayType = d.arrayOf(GridCell);
+  const GridArraySized = d.arrayOf(GridCell, TOTAL_CELLS);
 
   const particleBuffers = [
     root.createBuffer(ParticleArraySized).$usage("storage", "vertex"),
@@ -188,6 +201,7 @@ export async function createParticleSystem(
 
   const massBuffer = root.createBuffer(MassArraySized).$usage("storage");
   const restBuffer = root.createBuffer(RestArraySized).$usage("storage");
+  const gridBuffer = root.createBuffer(GridArraySized).$usage("storage");
 
   // Initialize data
   const logoPoints = await generateLogoPoints(particleCount, edgeWeight, rng);
@@ -210,12 +224,21 @@ export async function createParticleSystem(
   massBuffer.write(logoMassPoints);
   restBuffer.write(restPositions);
 
-  // Compute bind group layout (uses unsized array types)
+  const gridClearBindGroupLayout = tgpu.bindGroupLayout({
+    grid: { storage: GridArrayType, access: "mutable" },
+  });
+
+  const gridPopulateBindGroupLayout = tgpu.bindGroupLayout({
+    particles: { storage: ParticleArrayType },
+    grid: { storage: GridArrayType, access: "mutable" },
+  });
+
   const computeBindGroupLayout = tgpu.bindGroupLayout({
     particlesIn: { storage: ParticleArrayType },
     particlesOut: { storage: ParticleArrayType, access: "mutable" },
     massPoints: { storage: TargetArrayType },
     restTargets: { storage: RestArrayType },
+    grid: { storage: GridArrayType, access: "mutable" },
   });
 
   const {
@@ -223,9 +246,48 @@ export async function createParticleSystem(
     particlesOut,
     massPoints: massPointsBinding,
     restTargets,
+    grid: gridBinding,
   } = computeBindGroupLayout.bound;
 
-  // Simulation function
+  const { grid: gridClearBinding } = gridClearBindGroupLayout.bound;
+  const { particles: gridPopulateParticles, grid: gridPopulateBinding } =
+    gridPopulateBindGroupLayout.bound;
+
+  // Helper function to get grid cell index from position
+  const getCellIndex = (pos: d.v2f) => {
+    "use gpu";
+    // Map position from [-1, 1] to [0, GRID_SIZE)
+    const cellX = d.u32(
+      std.clamp(std.floor((pos.x + 1.0) / CELL_SIZE), 0, GRID_SIZE - 1)
+    );
+    const cellY = d.u32(
+      std.clamp(std.floor((pos.y + 1.0) / CELL_SIZE), 0, GRID_SIZE - 1)
+    );
+    return cellY * GRID_SIZE + cellX;
+  };
+
+  const clearGrid = (index: number) => {
+    "use gpu";
+    std.atomicStore(gridClearBinding.value[index]!.count, 0);
+  };
+
+  const populateGrid = (index: number) => {
+    "use gpu";
+    const particle = gridPopulateParticles.value[index]!;
+    const cellIdx = getCellIndex(particle.position);
+    // Access grid cell directly without copying (atomics are not constructible)
+    const slot = std.atomicAdd(gridPopulateBinding.value[cellIdx]!.count, 1);
+    // Only store if we have room
+    if (slot < MAX_PARTICLES_PER_CELL) {
+      gridPopulateBinding.value[cellIdx]!.particles[slot] = d.u32(index);
+    }
+  };
+
+  const clearGridPipeline =
+    root["~unstable"].createGuardedComputePipeline(clearGrid);
+  const populateGridPipeline =
+    root["~unstable"].createGuardedComputePipeline(populateGrid);
+
   const simulate = (index: number) => {
     "use gpu";
     const u = uniforms.$;
@@ -263,7 +325,7 @@ export async function createParticleSystem(
     const targetDir = std.select(
       d.vec2f(0, 0),
       std.mul(toTarget, 1.0 / targetDist),
-      targetDist > 0.001,
+      targetDist > 0.001
     );
 
     const springStrength = std.mix(18.0, 32.0, hover);
@@ -277,34 +339,64 @@ export async function createParticleSystem(
     const wiggleForce = std.mul(
       d.vec2f(
         std.sin(time * 5.5 + particleIdx * 0.23),
-        std.cos(time * 5.2 + particleIdx * 0.29),
+        std.cos(time * 5.2 + particleIdx * 0.29)
       ),
-      u.wiggleForceScale * hover,
+      u.wiggleForceScale * hover
     );
 
     const repulsionRadius = 0.05;
     const repulsionRadiusSq = repulsionRadius * repulsionRadius;
     const repulsionStrength = u.repelStrength;
     let repulsionForce = d.vec2f(0, 0);
-    const count = massCount;
-    for (let step = 1; step <= 37; step += 12) {
-      const neighborIdx = (index + step) % count;
-      const other = Particle(particlesIn.value[neighborIdx]!);
-      const diff = std.sub(pos, other.position);
-      const distSq = std.dot(diff, diff);
-      const within = distSq < repulsionRadiusSq;
-      const safeDist = std.max(distSq, 1e-5);
-      const invDist = std.div(1.0, std.sqrt(safeDist));
-      const dir = std.mul(diff, invDist);
-      const push = std.mul(
-        dir,
-        (repulsionRadius - std.sqrt(safeDist)) * repulsionStrength,
-      );
-      repulsionForce = std.select(
-        repulsionForce,
-        std.add(repulsionForce, push),
-        within,
-      );
+
+    // Use spatial hash to find nearby particles
+    const cellIdx = getCellIndex(pos);
+    const cellX = d.i32(cellIdx % GRID_SIZE);
+    const cellY = d.i32(cellIdx / GRID_SIZE);
+
+    // Check current cell and 8 neighbors (3x3 grid around current cell)
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = cellX + dx;
+        const ny = cellY + dy;
+        // Skip out-of-bounds cells
+        const inBounds = nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE;
+        if (!inBounds) continue;
+
+        const neighborCellIdx = d.u32(ny * GRID_SIZE + nx);
+        // Access grid cell directly without copying (atomics are not constructible)
+        const neighborCount = std.min(
+          std.atomicLoad(gridBinding.value[neighborCellIdx]!.count),
+          d.u32(MAX_PARTICLES_PER_CELL)
+        );
+
+        for (let j = 0; j < MAX_PARTICLES_PER_CELL; j++) {
+          const jInRange = d.u32(j) < neighborCount;
+          if (!jInRange) continue;
+
+          const otherIdx = gridBinding.value[neighborCellIdx]!.particles[j]!;
+          // Skip self
+          const isSelf = otherIdx === d.u32(index);
+          if (isSelf) continue;
+
+          const other = Particle(particlesIn.value[otherIdx]!);
+          const diff = std.sub(pos, other.position);
+          const distSq = std.dot(diff, diff);
+          const within = distSq < repulsionRadiusSq;
+          const safeDist = std.max(distSq, 1e-5);
+          const invDist = std.div(1.0, std.sqrt(safeDist));
+          const dir = std.mul(diff, invDist);
+          const push = std.mul(
+            dir,
+            (repulsionRadius - std.sqrt(safeDist)) * repulsionStrength
+          );
+          repulsionForce = std.select(
+            repulsionForce,
+            std.add(repulsionForce, push),
+            within
+          );
+        }
+      }
     }
 
     const totalForce = std.add(
@@ -313,9 +405,9 @@ export async function createParticleSystem(
         repulsionForce,
         std.add(
           gravity,
-          std.add(springForce, std.add(dampingForce, wiggleForce)),
-        ),
-      ),
+          std.add(springForce, std.add(dampingForce, wiggleForce))
+        )
+      )
     );
 
     // Update velocity with damping
@@ -328,7 +420,7 @@ export async function createParticleSystem(
     particle.velocity = std.select(
       particle.velocity,
       std.mul(particle.velocity, maxSpeed / speed),
-      speed > maxSpeed,
+      speed > maxSpeed
     );
 
     // Update position
@@ -340,6 +432,18 @@ export async function createParticleSystem(
   const computePipeline =
     root["~unstable"].createGuardedComputePipeline(simulate);
 
+  // Create grid bind groups
+  const gridClearBindGroup = root.createBindGroup(gridClearBindGroupLayout, {
+    grid: gridBuffer,
+  });
+
+  const gridPopulateBindGroups = [0, 1].map((idx) =>
+    root.createBindGroup(gridPopulateBindGroupLayout, {
+      particles: particleBuffers[idx]!,
+      grid: gridBuffer,
+    })
+  );
+
   // Create compute bind groups for ping-pong
   const computeBindGroups = [0, 1].map((idx) =>
     root.createBindGroup(computeBindGroupLayout, {
@@ -347,7 +451,8 @@ export async function createParticleSystem(
       particlesOut: particleBuffers[1 - idx]!,
       massPoints: massBuffer,
       restTargets: restBuffer,
-    }),
+      grid: gridBuffer,
+    })
   );
 
   // Vertex layout for instanced rendering
@@ -419,7 +524,7 @@ export async function createParticleSystem(
     return std.select(
       d.vec4f(0, 0, 0, 0),
       d.vec4f(input.color.x, input.color.y, input.color.z, smoothAlpha),
-      dist < 1.0,
+      dist < 1.0
     );
   });
 
@@ -474,7 +579,15 @@ export async function createParticleSystem(
 
     even = !even;
 
-    // Run compute shader
+    // Clear grid
+    clearGridPipeline.with(gridClearBindGroup).dispatchThreads(TOTAL_CELLS);
+
+    // Populate grid with current particle positions
+    populateGridPipeline
+      .with(gridPopulateBindGroups[even ? 0 : 1]!)
+      .dispatchThreads(particleCount);
+
+    // Run simulation compute shader
     computePipeline
       .with(computeBindGroups[even ? 0 : 1]!)
       .dispatchThreads(particleCount);
